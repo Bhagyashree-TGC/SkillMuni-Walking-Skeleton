@@ -1,0 +1,96 @@
+# Pull-request validation for SkillMuni Frontend.
+# Set as a required build validation on main (setup/azure-devops-setup.sh).
+# Its result is the only evidence that counts; agents' own claims do not.
+
+trigger: none
+pr: none   # Azure Repos uses the branch policy, not this trigger.
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: skillmuni-frontend-factory        # nodeVersion, auditLevel, useArtifactsFeed
+  - name: evidenceServiceConnection
+    value: factory-evidence                   # Azure Resource Manager service connection
+  - name: evidenceStorageAccount
+    value: ''                                 # set after setup/evidence-vault.sh, e.g. tgcfactoryevidence
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+    persistCredentials: false
+
+  - task: NodeTool@0
+    displayName: Use Node.js
+    inputs:
+      versionSpec: $(nodeVersion)
+
+  - bash: bash factory/ci/check-protected-paths.sh
+    displayName: Protected-path and role-scope check
+    env:
+      SOURCE_BRANCH: $(System.PullRequest.SourceBranch)
+
+  - bash: bash factory/ci/check-skips.sh
+    displayName: Skipped tests need an accepted known issue (D-069)
+
+  - bash: |
+      set -euo pipefail
+      mkdir -p .evidence
+      docker run --rm -v "$(Build.SourcesDirectory):/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+        dir /repo --redact --no-banner --exit-code 1 \
+        --report-format json --report-path /repo/.evidence/secret-scan.json
+    displayName: Secret scan (findings are redacted)
+
+  - task: npmAuthenticate@0
+    displayName: Authenticate to Azure Artifacts feed
+    condition: and(succeeded(), eq(variables.useArtifactsFeed, 'true'))
+    inputs:
+      workingFile: .npmrc
+
+  - bash: npm ci
+    displayName: Install dependencies (lock file only)
+
+  - bash: npm run lint --if-present
+    displayName: Lint
+
+  - bash: npm run test:ci
+    displayName: Unit tests
+    env:
+      CI: 'true'
+
+  - bash: npm run build
+    displayName: Build
+
+  - bash: npm audit --audit-level=$(auditLevel) --omit=dev
+    displayName: Dependency vulnerability check
+
+  - bash: npx playwright install --with-deps chromium
+    displayName: Install Playwright browser
+
+  - bash: npx playwright test --config e2e/playwright.config.ts
+    displayName: Acceptance tests (Playwright)
+    env:
+      CI: 'true'
+
+  - task: PublishTestResults@2
+    displayName: Publish test results
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: |
+        test-results/unit/**/*.xml
+        test-results/e2e/junit.xml
+      mergeTestResults: true
+      testRunTitle: PR $(System.PullRequest.PullRequestId) validation
+
+  - template: templates/evidence-steps.yml
+    parameters:
+      stage: pr-validation
+      evidenceServiceConnection: ${{ variables.evidenceServiceConnection }}
+      evidenceStorageAccount: ${{ variables.evidenceStorageAccount }}
+
+  - bash: bash factory/ci/repeat-failure.sh
+    displayName: Escalate on third consecutive failure
+    condition: failed()
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)

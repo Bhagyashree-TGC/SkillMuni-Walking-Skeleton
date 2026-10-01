@@ -1,0 +1,39 @@
+# Collects and stores evidence. Always runs, so failed runs are evidence too.
+parameters:
+  - name: stage
+    type: string
+  - name: evidenceServiceConnection
+    type: string
+  - name: evidenceStorageAccount
+    type: string
+
+steps:
+  - bash: bash factory/ci/evidence.sh "${{ parameters.stage }}"
+    displayName: Collect evidence
+    condition: always()
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish evidence artifact
+    condition: always()
+    inputs:
+      targetPath: $(Build.ArtifactStagingDirectory)/evidence
+      artifact: evidence-${{ parameters.stage }}-$(System.JobAttempt)
+
+  - task: AzureCLI@2
+    displayName: Store evidence in the immutable vault
+    condition: and(always(), ne('${{ parameters.evidenceStorageAccount }}', ''))
+    inputs:
+      azureSubscription: ${{ parameters.evidenceServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        dest="skillmuni-frontend/$(Build.BuildId)-$(System.JobAttempt)/${{ parameters.stage }}"
+        az storage blob upload-batch \
+          --auth-mode login \
+          --account-name "${{ parameters.evidenceStorageAccount }}" \
+          --destination evidence \
+          --destination-path "$dest" \
+          --source "$(Build.ArtifactStagingDirectory)/evidence" \
+          --only-show-errors
+        echo "Evidence stored at evidence/$dest"

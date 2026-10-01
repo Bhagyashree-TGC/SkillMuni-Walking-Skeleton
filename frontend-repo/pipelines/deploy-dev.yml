@@ -1,0 +1,117 @@
+# Build once on main, deploy to dev after Level 2 approval, then verify the dev URL.
+# The dev environment's approval check is configured in Azure DevOps (see SETUP-GUIDE.md).
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude: [docs/*, reviews/*]
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: skillmuni-frontend-factory        # nodeVersion, useArtifactsFeed, distFolder, devStorageAccount, devUrl
+  - name: evidenceServiceConnection
+    value: factory-evidence
+  - name: evidenceStorageAccount
+    value: ''
+  - name: deployServiceConnection
+    value: skillmuni-dev                       # Azure Resource Manager service connection for the dev subscription
+
+stages:
+  - stage: Build
+    displayName: Build once
+    jobs:
+      - job: build
+        steps:
+          - checkout: self
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+          - task: npmAuthenticate@0
+            condition: and(succeeded(), eq(variables.useArtifactsFeed, 'true'))
+            inputs:
+              workingFile: .npmrc
+          - bash: npm ci
+            displayName: Install dependencies
+          - bash: npm run build
+            displayName: Build
+          - task: PublishPipelineArtifact@1
+            displayName: Publish build output
+            inputs:
+              targetPath: $(distFolder)
+              artifact: web
+
+  - stage: DeployDev
+    displayName: Deploy to dev
+    dependsOn: Build
+    jobs:
+      - deployment: deploy
+        environment: skillmuni-frontend-dev    # Level 2 approval check lives on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: web
+                - task: AzureCLI@2
+                  displayName: Upload to dev static website
+                  inputs:
+                    azureSubscription: ${{ variables.deployServiceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az storage blob upload-batch \
+                        --auth-mode login \
+                        --account-name "$(devStorageAccount)" \
+                        --destination '$web' \
+                        --source "$(Pipeline.Workspace)/web" \
+                        --overwrite --only-show-errors
+                      echo "Deployed build $(Build.BuildNumber) to dev."
+
+  - stage: VerifyDev
+    displayName: Verify dev URL
+    dependsOn: DeployDev
+    jobs:
+      - job: verify
+        steps:
+          - checkout: self
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+          - bash: |
+              set -euo pipefail
+              for i in 1 2 3 4 5 6; do
+                code=$(curl -s -o /dev/null -w '%{http_code}' "$(devUrl)") || code=000
+                echo "Attempt $i: HTTP $code"
+                [[ "$code" == "200" ]] && exit 0
+                sleep 10
+              done
+              echo "##vso[task.logissue type=error]Dev URL did not return 200."
+              exit 1
+            displayName: Dev URL responds
+          - task: npmAuthenticate@0
+            condition: and(succeeded(), eq(variables.useArtifactsFeed, 'true'))
+            inputs:
+              workingFile: .npmrc
+          - bash: npm ci && npx playwright install --with-deps chromium
+            displayName: Prepare Playwright
+          - bash: npx playwright test --config e2e/playwright.config.ts --grep @smoke --pass-with-no-tests
+            displayName: Smoke tests against dev
+            env:
+              CI: 'true'
+              BASE_URL: $(devUrl)
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: test-results/e2e/junit.xml
+              testRunTitle: Dev verification $(Build.BuildNumber)
+          - template: templates/evidence-steps.yml
+            parameters:
+              stage: dev-verification
+              evidenceServiceConnection: ${{ variables.evidenceServiceConnection }}
+              evidenceStorageAccount: ${{ variables.evidenceStorageAccount }}
